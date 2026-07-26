@@ -42,6 +42,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
   const [questions, setQuestions] = useState<GroupQuestion[]>([]);
   const [progress, setProgress] = useState<Map<number, ProgressRecord>>(new Map());
   const [loadingRound, setLoadingRound] = useState(false);
+  const [roundError, setRoundError] = useState('');
   const [qIdx, setQIdx] = useState(0);
   const [showList, setShowList] = useState(false);
   const [confirmResetRound, setConfirmResetRound] = useState(false);
@@ -121,6 +122,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
   const openRound = async (r: number) => {
     stopClock();
     setLoadingRound(true);
+    setRoundError('');
     setRound(r);
     setView('round');
     try {
@@ -132,6 +134,11 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
       setQIdx(resumeIdx);
       applyPhaseForRecord(prog.get(qs[resumeIdx]?.position ?? -1));
       setShowList(false);
+      if (qs.length === 0) setRoundError('لسه مفيش أسئلة في الجولة دي — تأكد إنك شغّلت supabase/group_training_v2.sql');
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : JSON.stringify(err);
+      setRoundError(`تعذّر تحميل الأسئلة: ${detail}`);
+      setQuestions([]);
     } finally {
       setLoadingRound(false);
     }
@@ -145,6 +152,8 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
     try {
       const [qs, prog] = await Promise.all([getRoundQuestions(r), getRoundProgress(r)]);
       setStatsData({ questions: qs, progress: prog });
+    } catch {
+      setStatsData({ questions: [], progress: new Map() });
     } finally {
       setLoadingStats(false);
     }
@@ -183,7 +192,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
     setTimerDuration(dur);
     setTimeLeft(dur);
     setPhase('running');
-    timerEndRef.current = Date.now() + dur * 1000;
+    timerEndRef.current = Date.now() + dur \* 1000;
     stopClock();
     timerRef.current = setInterval(() => {
       const remaining = Math.max(0, (timerEndRef.current - Date.now()) / 1000);
@@ -245,7 +254,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
       await saveQuestionProgress(round, q.position, attempts, final);
       if (pendingJudge === 'correct') await awardGroupPoints(playerId, 5);
     } catch {
-      /* best-effort — local UI already reflects the attempt */
+      /\* best-effort — local UI already reflects the attempt \*/
     }
   };
 
@@ -255,7 +264,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
   const doResetQuestion = async () => {
     const q = currentQ;
     if (!q) return;
-    try { await resetQuestionApi(round, q.position); } catch { /* noop */ }
+    try { await resetQuestionApi(round, q.position); } catch { /\* noop \*/ }
     setProgress((prev) => { const next = new Map(prev); next.delete(q.position); return next; });
     setPhase('idle');
     setAttemptNum(1);
@@ -266,7 +275,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
 
   const confirmAndResetRound = async () => {
     setConfirmResetRound(false);
-    try { await resetRoundApi(round); } catch { /* noop */ }
+    try { await resetRoundApi(round); } catch { /\* noop \*/ }
     setProgress(new Map());
     setQIdx(0);
     setPhase('idle');
@@ -297,7 +306,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
           <div className="px-4 flex flex-col gap-3 mt-2">
             {ALL_ROUNDS.map((r) => {
               const s = roundsSummary[r] ?? { total: 0, answered: 0 };
-              const pct = s.total ? Math.round((s.answered / s.total) * 100) : 0;
+              const pct = s.total ? Math.round((s.answered / s.total) \* 100) : 0;
               return (
                 <div key={r} className="glass-md rounded-2xl p-4">
                   <p className="font-black text-lg text-white" style={{ fontFamily: "'Tajawal',sans-serif" }}>الجولة {ROUND_LABELS[r]}</p>
@@ -417,10 +426,23 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
   }
 
   // ── ROUND ─────────────────────────────────────────────────────────────
-  if (loadingRound || !currentQ) {
+  if (loadingRound || (!currentQ && !roundError)) {
     return (
       <div className="relative min-h-dvh flex items-center justify-center">
         <div className="w-8 h-8 rounded-full animate-spin-slow" style={{ border: '3px solid rgba(255,255,255,0.15)', borderTopColor: ACCENT }} />
+      </div>
+    );
+  }
+
+  if (roundError) {
+    return (
+      <div className="relative min-h-dvh flex flex-col items-center justify-center gap-4 px-6 text-center">
+        <p className="text-4xl">⚠️</p>
+        <p className="text-white/70 text-sm" style={{ fontFamily: "'Tajawal',sans-serif" }}>{roundError}</p>
+        <div className="flex gap-3">
+          <button onClick={() => openRound(round)} className="px-5 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: `linear-gradient(135deg,${GRAD_FROM},${GRAD_TO})`, fontFamily: "'Tajawal',sans-serif" }}>حاول تاني</button>
+          <button onClick={goHome} className="px-5 py-2.5 rounded-xl text-sm font-bold glass-md text-white/60" style={{ fontFamily: "'Tajawal',sans-serif" }}>الرئيسية</button>
+        </div>
       </div>
     );
   }
@@ -429,7 +451,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
 
   return (
     <div className="relative min-h-dvh flex flex-col pb-28 overflow-hidden">
-      {/* Top actions */}
+      {/\* Top actions \*/}
       <div className="px-4 pt-10 pb-2 flex items-center gap-2 flex-wrap">
         <button onClick={goHome} className="text-xs px-3 py-1.5 rounded-lg glass-md" style={{ color: ACCENT, fontFamily: "'Tajawal',sans-serif" }}>الرئيسية</button>
         <button onClick={() => setShowList((v) => !v)} className="text-xs px-3 py-1.5 rounded-lg glass-md text-white/50" style={{ fontFamily: "'Tajawal',sans-serif" }}>قائمة الأسئلة</button>
@@ -443,7 +465,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
         </button>
       </div>
 
-      {/* Question list overlay */}
+      {/\* Question list overlay \*/}
       {showList && (
         <div className="px-4 mb-2">
           <div className="glass-md rounded-2xl p-3 grid grid-cols-6 gap-1.5 max-h-64 overflow-y-auto">
@@ -470,7 +492,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
         </div>
       )}
 
-      {/* Header row: question count + nav arrows */}
+      {/\* Header row: question count + nav arrows \*/}
       <div className="px-4 flex items-center justify-between mb-2">
         <span className="text-white/35 text-xs font-exo">الجولة {ROUND_LABELS[round]} — سؤال {qIdx + 1} من {questions.length}</span>
         <div className="flex gap-2">
@@ -512,7 +534,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
                   cx="48" cy="48" r="44" strokeWidth="4" fill="none"
                   stroke={timerColor}
                   strokeDasharray="276.46"
-                  strokeDashoffset={276.46 - (timeLeft / timerDuration) * 276.46}
+                  strokeDashoffset={276.46 - (timeLeft / timerDuration) \* 276.46}
                   style={{ filter: `drop-shadow(0 0 6px ${timerColor})`, transition: 'stroke-dashoffset 0.1s linear' }}
                 />
               </svg>
