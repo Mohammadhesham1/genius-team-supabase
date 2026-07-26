@@ -192,7 +192,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
     setTimerDuration(dur);
     setTimeLeft(dur);
     setPhase('running');
-    timerEndRef.current = Date.now() + dur \* 1000;
+    timerEndRef.current = Date.now() + dur * 1000;
     stopClock();
     timerRef.current = setInterval(() => {
       const remaining = Math.max(0, (timerEndRef.current - Date.now()) / 1000);
@@ -254,7 +254,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
       await saveQuestionProgress(round, q.position, attempts, final);
       if (pendingJudge === 'correct') await awardGroupPoints(playerId, 5);
     } catch {
-      /\* best-effort — local UI already reflects the attempt \*/
+      /* best-effort — local UI already reflects the attempt */
     }
   };
 
@@ -264,7 +264,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
   const doResetQuestion = async () => {
     const q = currentQ;
     if (!q) return;
-    try { await resetQuestionApi(round, q.position); } catch { /\* noop \*/ }
+    try { await resetQuestionApi(round, q.position); } catch { /* noop */ }
     setProgress((prev) => { const next = new Map(prev); next.delete(q.position); return next; });
     setPhase('idle');
     setAttemptNum(1);
@@ -275,7 +275,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
 
   const confirmAndResetRound = async () => {
     setConfirmResetRound(false);
-    try { await resetRoundApi(round); } catch { /\* noop \*/ }
+    try { await resetRoundApi(round); } catch { /* noop */ }
     setProgress(new Map());
     setQIdx(0);
     setPhase('idle');
@@ -306,7 +306,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
           <div className="px-4 flex flex-col gap-3 mt-2">
             {ALL_ROUNDS.map((r) => {
               const s = roundsSummary[r] ?? { total: 0, answered: 0 };
-              const pct = s.total ? Math.round((s.answered / s.total) \* 100) : 0;
+              const pct = s.total ? Math.round((s.answered / s.total) * 100) : 0;
               return (
                 <div key={r} className="glass-md rounded-2xl p-4">
                   <p className="font-black text-lg text-white" style={{ fontFamily: "'Tajawal',sans-serif" }}>الجولة {ROUND_LABELS[r]}</p>
@@ -451,7 +451,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
 
   return (
     <div className="relative min-h-dvh flex flex-col pb-28 overflow-hidden">
-      {/\* Top actions \*/}
+      {/* Top actions */}
       <div className="px-4 pt-10 pb-2 flex items-center gap-2 flex-wrap">
         <button onClick={goHome} className="text-xs px-3 py-1.5 rounded-lg glass-md" style={{ color: ACCENT, fontFamily: "'Tajawal',sans-serif" }}>الرئيسية</button>
         <button onClick={() => setShowList((v) => !v)} className="text-xs px-3 py-1.5 rounded-lg glass-md text-white/50" style={{ fontFamily: "'Tajawal',sans-serif" }}>قائمة الأسئلة</button>
@@ -465,7 +465,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
         </button>
       </div>
 
-      {/\* Question list overlay \*/}
+      {/* Question list overlay */}
       {showList && (
         <div className="px-4 mb-2">
           <div className="glass-md rounded-2xl p-3 grid grid-cols-6 gap-1.5 max-h-64 overflow-y-auto">
@@ -492,7 +492,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
         </div>
       )}
 
-      {/\* Header row: question count + nav arrows \*/}
+      {/* Header row: question count + nav arrows */}
       <div className="px-4 flex items-center justify-between mb-2">
         <span className="text-white/35 text-xs font-exo">الجولة {ROUND_LABELS[round]} — سؤال {qIdx + 1} من {questions.length}</span>
         <div className="flex gap-2">
@@ -534,7 +534,7 @@ export default function GroupTrainingPage({ user: _user, navigate: _navigate }: 
                   cx="48" cy="48" r="44" strokeWidth="4" fill="none"
                   stroke={timerColor}
                   strokeDasharray="276.46"
-                  strokeDashoffset={276.46 - (timeLeft / timerDuration) \* 276.46}
+                  strokeDashoffset={276.46 - (timeLeft / timerDuration) * 276.46}
                   style={{ filter: `drop-shadow(0 0 6px ${timerColor})`, transition: 'stroke-dashoffset 0.1s linear' }}
                 />
               </svg>
