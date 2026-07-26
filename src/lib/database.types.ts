@@ -16,6 +16,14 @@ export type MatchResult = 'win' | 'loss' | 'draw';
 export type GroupSessionStatus = 'active' | 'completed';
 export type PointsMode = 'solo' | 'group' | 'oneVone';
 
+/** One judged attempt on a group_progress question — mirrors the reference app's local state shape. */
+export interface GroupAttempt {
+  n: number;           // attempt number (1 or 2)
+  time_s: number;      // seconds elapsed
+  player_id: string;   // users.id credited for this attempt
+  result: 'correct' | 'wrong';
+}
+
 export interface Database {
   public: {
     Tables: {
@@ -153,6 +161,23 @@ export interface Database {
           answer: string;
         };
         Update: Partial<Database['public']['Tables']['group_round_questions']['Insert']>;
+      };
+      group_progress: {
+        Row: {
+          round_no: number;
+          position: number;
+          attempts: GroupAttempt[];
+          final: 'correct' | 'wrong' | null;
+          updated_at: string;
+        };
+        Insert: {
+          round_no: number;
+          position: number;
+          attempts?: GroupAttempt[];
+          final?: 'correct' | 'wrong' | null;
+          updated_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['group_progress']['Insert']>;
       };
       solo_progress: {
         Row: { user_id: string; subject_id: string; next_position: number };

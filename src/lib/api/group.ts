@@ -1,7 +1,7 @@
 import { supabase } from '../supabaseClient';
-import type { Database } from '../database.types';
+import type { GroupAttempt } from '../database.types';
 
-type GroupRoundQuestionRow = Database['public']['Tables']['group_round_questions']['Row'];
+export type { GroupAttempt };
 
 export interface GroupQuestion {
   id: number;
@@ -10,92 +10,108 @@ export interface GroupQuestion {
   position: number;
 }
 
-function mapGroupQuestionRow(row: GroupRoundQuestionRow): GroupQuestion {
-  return { id: row.id, question: row.question, answer: row.answer, position: row.position ?? 0 };
+export interface ProgressRecord {
+  attempts: GroupAttempt[];
+  final: 'correct' | 'wrong' | null;
 }
 
-/**
- * Group sessions are round-based (`group_round_questions.round_no`) so the
- * same family/group doesn't repeat a round it already finished. Picks the
- * round right after the last *completed* one for this subject, falling back
- * to round 1 if nothing has been authored yet for that round number.
- */
-export async function pickNextRound(subjectId: string): Promise<number> {
-  const { data: completed, error: compErr } = await supabase
-    .from('group_sessions')
-    .select('round_no')
-    .eq('subject_id', subjectId)
-    .eq('status', 'completed')
-    .order('round_no', { ascending: false })
-    .limit(1);
-  if (compErr) throw compErr;
+const ROUND_NUMBERS = [1, 2, 3, 4, 5];
 
-  const lastCompleted = completed?.[0]?.round_no ?? 0;
-  let nextRound = lastCompleted + 1;
-
-  const { count, error: countErr } = await supabase
-    .from('group_round_questions')
-    .select('*', { count: 'exact', head: true })
-    .eq('subject_id', subjectId)
-    .eq('round_no', nextRound);
-  if (countErr) throw countErr;
-  if (!count) nextRound = 1; // no fresh round authored yet — replay round 1
-
-  return nextRound;
-}
-
-export async function getGroupRoundQuestions(subjectId: string, roundNo: number): Promise<GroupQuestion[]> {
+/** All questions for one of the 5 fixed general-knowledge rounds. */
+export async function getRoundQuestions(roundNo: number): Promise<GroupQuestion[]> {
   const { data, error } = await supabase
     .from('group_round_questions')
     .select('*')
-    .eq('subject_id', subjectId)
+    .is('subject_id', null)
     .eq('round_no', roundNo)
     .order('position', { ascending: true });
   if (error) throw error;
-  return (data ?? []).map(mapGroupQuestionRow);
+  return (data ?? []).map((r) => ({ id: r.id, question: r.question, answer: r.answer, position: r.position ?? 0 }));
 }
 
-export async function createGroupSession(subjectId: string, roundNo: number, hostUserId: string): Promise<string> {
-  const { data, error } = await supabase
-    .from('group_sessions')
-    .insert({ subject_id: subjectId, round_no: roundNo, host_user_id: hostUserId })
-    .select('id')
-    .single();
+/** Saved attempts/final result for every answered question in a round, keyed by position. */
+export async function getRoundProgress(roundNo: number): Promise<Map<number, ProgressRecord>> {
+  const { data, error } = await supabase.from('group_progress').select('*').eq('round_no', roundNo);
   if (error) throw error;
-  return data.id;
-}
-
-export interface SubmitGroupAnswerParams {
-  sessionId: string;
-  position: number;
-  attemptNo: 1 | 2;
-  timeMs: number;
-  isCorrect: boolean;
-  creditedUserId: string | null;
-}
-
-/** Inserts the attempt — a DB trigger awards 5 points to the credited member when correct. */
-export async function submitGroupAnswer(params: SubmitGroupAnswerParams): Promise<void> {
-  const { error } = await supabase.from('group_answers').insert({
-    session_id: params.sessionId,
-    position: params.position,
-    attempt_no: params.attemptNo,
-    time_ms: params.timeMs,
-    is_correct: params.isCorrect,
-    credited_user_id: params.creditedUserId,
+  const map = new Map<number, ProgressRecord>();
+  (data ?? []).forEach((r) => {
+    map.set(r.position, { attempts: (r.attempts as GroupAttempt[]) ?? [], final: r.final });
   });
-  if (error) throw error;
+  return map;
 }
 
-export async function updateGroupSessionProgress(sessionId: string, currentQidx: number): Promise<void> {
-  const { error } = await supabase.from('group_sessions').update({ current_qidx: currentQidx }).eq('id', sessionId);
-  if (error) throw error;
+/** Question count + answered count per round, for the home screen's 5 round cards. */
+export async function getRoundsSummary(): Promise<Record<number, { total: number; answered: number }>> {
+  const [{ data: qRows, error: qErr }, { data: pRows, error: pErr }] = await Promise.all([
+    supabase.from('group_round_questions').select('round_no').is('subject_id', null).in('round_no', ROUND_NUMBERS),
+    supabase.from('group_progress').select('round_no,final').in('round_no', ROUND_NUMBERS),
+  ]);
+  if (qErr) throw qErr;
+  if (pErr) throw pErr;
+
+  const summary: Record<number, { total: number; answered: number }> = {};
+  ROUND_NUMBERS.forEach((r) => { summary[r] = { total: 0, answered: 0 }; });
+  (qRows ?? []).forEach((r) => { summary[r.round_no].total += 1; });
+  (pRows ?? []).forEach((r) => { if (r.final) summary[r.round_no].answered += 1; });
+  return summary;
 }
 
-export async function completeGroupSession(sessionId: string): Promise<void> {
+/** Upserts the full attempts array + final result for one question — mirrors the reference app's "save whole record" pattern. */
+export async function saveQuestionProgress(
+  roundNo: number,
+  position: number,
+  attempts: GroupAttempt[],
+  final: 'correct' | 'wrong' | null
+): Promise<void> {
   const { error } = await supabase
-    .from('group_sessions')
-    .update({ status: 'completed', ended_at: new Date().toISOString() })
-    .eq('id', sessionId);
+    .from('group_progress')
+    .upsert(
+      { round_no: roundNo, position, attempts, final, updated_at: new Date().toISOString() },
+      { onConflict: 'round_no,position' }
+    );
   if (error) throw error;
+}
+
+/** Awards (or reverses, with a negative amount) group-mode points via the schema's existing point-award function. */
+export async function awardGroupPoints(userId: string, points: number): Promise<void> {
+  const { error } = await supabase.rpc('fn_award_points', { p_user_id: userId, p_points: points, p_mode: 'group' });
+  if (error) throw error;
+}
+
+/** Resets one question: reverses the 5 points if it had been answered correctly, then deletes its saved state. */
+export async function resetQuestion(roundNo: number, position: number): Promise<void> {
+  const { data, error } = await supabase
+    .from('group_progress')
+    .select('*')
+    .eq('round_no', roundNo)
+    .eq('position', position)
+    .maybeSingle();
+  if (error) throw error;
+
+  if (data?.final === 'correct') {
+    const correctAttempt = (data.attempts as GroupAttempt[]).find((a) => a.result === 'correct');
+    if (correctAttempt) await awardGroupPoints(correctAttempt.player_id, -5);
+  }
+
+  const { error: delErr } = await supabase.from('group_progress').delete().eq('round_no', roundNo).eq('position', position);
+  if (delErr) throw delErr;
+}
+
+/** Resets an entire round: reverses points for every correctly-answered question, then clears all its saved state. */
+export async function resetRound(roundNo: number): Promise<void> {
+  const { data, error } = await supabase.from('group_progress').select('*').eq('round_no', roundNo);
+  if (error) throw error;
+  const rows = data ?? [];
+
+  await Promise.all(
+    rows
+      .filter((r) => r.final === 'correct')
+      .map((r) => {
+        const correctAttempt = (r.attempts as GroupAttempt[]).find((a) => a.result === 'correct');
+        return correctAttempt ? awardGroupPoints(correctAttempt.player_id, -5) : Promise.resolve();
+      })
+  );
+
+  const { error: delErr } = await supabase.from('group_progress').delete().eq('round_no', roundNo);
+  if (delErr) throw delErr;
 }

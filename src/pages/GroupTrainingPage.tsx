@@ -1,15 +1,17 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import type { User, PageName, Subject } from '../types';
-import { getUserSubjects, getSubjectById } from '../lib/api/subjects';
+import { useState, useEffect, useRef } from 'react';
+import type { User, PageName } from '../types';
 import { getAllUsers } from '../lib/auth';
 import {
-  pickNextRound,
-  getGroupRoundQuestions,
-  createGroupSession,
-  submitGroupAnswer,
-  updateGroupSessionProgress,
-  completeGroupSession,
+  getRoundQuestions,
+  getRoundProgress,
+  getRoundsSummary,
+  saveQuestionProgress,
+  awardGroupPoints,
+  resetQuestion as resetQuestionApi,
+  resetRound as resetRoundApi,
   type GroupQuestion,
+  type ProgressRecord,
+  type GroupAttempt,
 } from '../lib/api/group';
 
 interface GroupTrainingPageProps {
@@ -17,609 +19,649 @@ interface GroupTrainingPageProps {
   navigate: (page: PageName, params?: Record<string, string>) => void;
 }
 
-type Phase = 'pick-subject' | 'no-questions' | 'ready' | 'timer' | 'grace' | 'reveal' | 'timer2' | 'grace2' | 'second-reveal' | 'assign-member' | 'round-summary';
+type View = 'home' | 'round' | 'stats';
+type Phase = 'idle' | 'running' | 'revealed' | 'pickPlayer' | 'done';
 
-const TIMER1 = 20;
-const TIMER2 = 10;
-const GRACE = 6;
+const ROUND_LABELS: Record<number, string> = { 1: 'الأولى', 2: 'الثانية', 3: 'الثالثة', 4: 'الرابعة', 5: 'الخامسة' };
+const ALL_ROUNDS = [1, 2, 3, 4, 5];
+const ACCENT = '#60a5fa';
+const GRAD_FROM = '#3b82f6';
+const GRAD_TO = '#8b5cf6';
 
-interface RoundEntry {
-  qIdx: number;
-  correct: boolean;
-  timeMs: number;
-  memberId?: string;
-  attempt: 1 | 2;
+function fmt(n: number | null): string {
+  return n === null || n === undefined ? '—' : `${Math.round(n)} ث`;
 }
 
-export default function GroupTrainingPage({ user, navigate: _navigate }: GroupTrainingPageProps) {
-  const [subjects, setSubjects] = useState<Subject[]>([]);
-  const [loadingSubjects, setLoadingSubjects] = useState(true);
-  const [roundPreview, setRoundPreview] = useState<Record<string, number>>({});
+export default function GroupTrainingPage({ user: _user, navigate: _navigate }: GroupTrainingPageProps) {
+  const [view, setView] = useState<View>('home');
   const [allUsers, setAllUsers] = useState<User[]>([]);
+  const [roundsSummary, setRoundsSummary] = useState<Record<number, { total: number; answered: number }>>({});
+  const [loadingHome, setLoadingHome] = useState(true);
 
-  const [subjectId, setSubjectId] = useState('');
-  const [subject, setSubject] = useState<Subject | null>(null);
-  const [roundNo, setRoundNo] = useState(1);
-  const [sessionId, setSessionId] = useState('');
+  const [round, setRound] = useState(1);
   const [questions, setQuestions] = useState<GroupQuestion[]>([]);
-  const [loadingQuestions, setLoadingQuestions] = useState(false);
+  const [progress, setProgress] = useState<Map<number, ProgressRecord>>(new Map());
+  const [loadingRound, setLoadingRound] = useState(false);
   const [qIdx, setQIdx] = useState(0);
-  const [phase, setPhase] = useState<Phase>('pick-subject');
-  const [timeLeft, setTimeLeft] = useState(TIMER1);
-  const [startTime, setStartTime] = useState(0);
-  const [elapsed, setElapsed] = useState(0);
-  const [entries, setEntries] = useState<RoundEntry[]>([]);
-  const [pendingEntry, setPendingEntry] = useState<Partial<RoundEntry>>({});
-  const [showSidebar, setShowSidebar] = useState(false);
-  const [showSummary, setShowSummary] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [showList, setShowList] = useState(false);
+  const [confirmResetRound, setConfirmResetRound] = useState(false);
 
-  const currentQ = questions[qIdx];
+  const [phase, setPhase] = useState<Phase>('idle');
+  const [attemptNum, setAttemptNum] = useState<1 | 2>(1);
+  const [timerDuration, setTimerDuration] = useState(20);
+  const [timeLeft, setTimeLeft] = useState(20);
+  const [pendingElapsed, setPendingElapsed] = useState<number | null>(null);
+  const [pendingJudge, setPendingJudge] = useState<'correct' | 'wrong' | null>(null);
+
+  const [statsRound, setStatsRound] = useState(1);
+  const [statsData, setStatsData] = useState<{ questions: GroupQuestion[]; progress: Map<number, ProgressRecord> } | null>(null);
+  const [loadingStats, setLoadingStats] = useState(false);
+
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const timerEndRef = useRef(0);
+  const timerDurationRef = useRef(20);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+
   const rightRow = allUsers.filter((u) => u.row === 'right');
-  const leftRow  = allUsers.filter((u) => u.row === 'left');
+  const leftRow = allUsers.filter((u) => u.row === 'left');
+  const currentQ = questions[qIdx];
 
   useEffect(() => {
     getAllUsers().then(setAllUsers).catch(() => setAllUsers([]));
   }, []);
 
   useEffect(() => {
+    if (view !== 'home') return;
     let cancelled = false;
-    setLoadingSubjects(true);
-    getUserSubjects(user.id)
-      .then(async (list) => {
-        if (cancelled) return;
-        setSubjects(list);
-        const rounds = await Promise.all(list.map((s) => pickNextRound(s.id).catch(() => 1)));
-        if (cancelled) return;
-        const map: Record<string, number> = {};
-        list.forEach((s, i) => { map[s.id] = rounds[i]; });
-        setRoundPreview(map);
-      })
-      .catch(() => {
-        if (!cancelled) setSubjects([]);
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingSubjects(false);
-      });
+    setLoadingHome(true);
+    getRoundsSummary()
+      .then((s) => { if (!cancelled) setRoundsSummary(s); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoadingHome(false); });
     return () => { cancelled = true; };
-  }, [user.id]);
+  }, [view]);
 
-  const stopTimer = useCallback(() => {
+  useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
+
+  const stopClock = () => {
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-  }, []);
+  };
 
-  const startCountdown = useCallback((seconds: number, onDone: () => void) => {
-    stopTimer();
-    const t0 = Date.now();
-    setStartTime(t0);
-    setTimeLeft(seconds);
-    timerRef.current = setInterval(() => {
-      setTimeLeft((t) => {
-        if (t <= 1) { clearInterval(timerRef.current!); timerRef.current = null; onDone(); return 0; }
-        return t - 1;
-      });
-    }, 1000);
-  }, [stopTimer]);
-
-  useEffect(() => () => stopTimer(), [stopTimer]);
-
-  useEffect(() => {
-    if (phase === 'grace') startCountdown(GRACE, () => setPhase('reveal'));
-    else if (phase === 'timer2') startCountdown(TIMER2, () => setPhase('grace2'));
-    else if (phase === 'grace2') startCountdown(GRACE, () => setPhase('second-reveal'));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase]);
-
-  const startSubject = async (sid: string) => {
-    setLoadingQuestions(true);
-    setSubjectId(sid);
-    try {
-      const [s, nextRound] = await Promise.all([getSubjectById(sid), pickNextRound(sid)]);
-      const qs = await getGroupRoundQuestions(sid, nextRound);
-      setSubject(s);
-      setRoundNo(nextRound);
-
-      if (qs.length === 0) {
-        setPhase('no-questions');
-        return;
+  function getAudioCtx(): AudioContext | null {
+    if (!audioCtxRef.current) {
+      try {
+        const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        audioCtxRef.current = new Ctor();
+      } catch {
+        audioCtxRef.current = null;
       }
-      const newSessionId = await createGroupSession(sid, nextRound, user.id);
-      setSessionId(newSessionId);
+    }
+    return audioCtxRef.current;
+  }
+  function playTimerEndSound() {
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const now = ctx.currentTime;
+    [0, 0.16].forEach((offset, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = i === 0 ? 880 : 660;
+      gain.gain.setValueAtTime(0.0001, now + offset);
+      gain.gain.exponentialRampToValueAtTime(0.35, now + offset + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.15);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + offset);
+      osc.stop(now + offset + 0.17);
+    });
+  }
+
+  const openRound = async (r: number) => {
+    stopClock();
+    setLoadingRound(true);
+    setRound(r);
+    setView('round');
+    try {
+      const [qs, prog] = await Promise.all([getRoundQuestions(r), getRoundProgress(r)]);
       setQuestions(qs);
-      setQIdx(0);
-      setEntries([]);
-      setPhase('ready');
-    } catch {
-      setPhase('no-questions');
+      setProgress(prog);
+      let resumeIdx = qs.findIndex((q) => !prog.get(q.position)?.final);
+      if (resumeIdx === -1) resumeIdx = 0;
+      setQIdx(resumeIdx);
+      applyPhaseForRecord(prog.get(qs[resumeIdx]?.position ?? -1));
+      setShowList(false);
     } finally {
-      setLoadingQuestions(false);
+      setLoadingRound(false);
     }
   };
 
-  const beginTimer = () => {
-    setPhase('timer');
-    startCountdown(TIMER1, () => setPhase('grace'));
-  };
-
-  const handleAnswerButton = () => {
-    const e = Date.now() - startTime;
-    setElapsed(e);
-    stopTimer();
-    if (phase === 'timer') setPhase('grace');
-    else if (phase === 'timer2') setPhase('grace2');
-  };
-
-  const handleCorrect = () => {
-    setPendingEntry({ correct: true, timeMs: elapsed, attempt: phase === 'reveal' ? 1 : 2 });
-    setPhase('assign-member');
-  };
-
-  const handleWrong = () => {
-    if (phase === 'reveal') {
-      // Give second chance
-      setPhase('timer2');
-      return;
+  const openStats = async (r: number) => {
+    stopClock();
+    setStatsRound(r);
+    setView('stats');
+    setLoadingStats(true);
+    try {
+      const [qs, prog] = await Promise.all([getRoundQuestions(r), getRoundProgress(r)]);
+      setStatsData({ questions: qs, progress: prog });
+    } finally {
+      setLoadingStats(false);
     }
-    // Final wrong — persist (no one credited) and move on.
-    if (currentQ) {
-      submitGroupAnswer({
-        sessionId,
-        position: currentQ.position,
-        attemptNo: 2,
-        timeMs: elapsed,
-        isCorrect: false,
-        creditedUserId: null,
-      }).catch(() => {});
-    }
-    setEntries((e) => [...e, { qIdx, correct: false, timeMs: elapsed, attempt: 2 }]);
-    nextQuestion();
   };
 
-  const assignMember = (memberId: string) => {
-    if (currentQ) {
-      submitGroupAnswer({
-        sessionId,
-        position: currentQ.position,
-        attemptNo: (pendingEntry.attempt ?? 1) as 1 | 2,
-        timeMs: pendingEntry.timeMs ?? elapsed,
-        isCorrect: true,
-        creditedUserId: memberId,
-      }).catch(() => {});
-    }
-    setEntries((e) => [...e, { ...pendingEntry, qIdx, memberId } as RoundEntry]);
-    setPendingEntry({});
-    nextQuestion();
+  const goHome = () => {
+    stopClock();
+    setView('home');
   };
 
-  const nextQuestion = () => {
-    const next = qIdx + 1;
-    if (next >= questions.length) {
-      completeGroupSession(sessionId).catch(() => {});
-      setShowSummary(true);
-      setPhase('round-summary');
-      return;
+  function applyPhaseForRecord(rec: ProgressRecord | undefined) {
+    if (rec?.final) {
+      setPhase('done');
+      setAttemptNum(rec.attempts.length >= 2 ? 2 : 1);
+    } else {
+      setPhase('idle');
+      setAttemptNum(1);
     }
-    updateGroupSessionProgress(sessionId, next).catch(() => {});
-    setQIdx(next);
-    setPhase('ready');
+    setTimerDuration(20);
+    setPendingJudge(null);
+    setPendingElapsed(null);
+  }
+
+  const goToQuestion = (idx: number) => {
+    stopClock();
+    const clamped = Math.max(0, Math.min(questions.length - 1, idx));
+    setQIdx(clamped);
+    applyPhaseForRecord(progress.get(questions[clamped]?.position ?? -1));
+    setShowList(false);
   };
 
-  const timerMax = phase === 'timer' || phase === 'grace' ? TIMER1 : TIMER2;
+  const startTimer = () => {
+    getAudioCtx();
+    const dur = attemptNum === 1 ? 20 : 10;
+    timerDurationRef.current = dur;
+    setTimerDuration(dur);
+    setTimeLeft(dur);
+    setPhase('running');
+    timerEndRef.current = Date.now() + dur * 1000;
+    stopClock();
+    timerRef.current = setInterval(() => {
+      const remaining = Math.max(0, (timerEndRef.current - Date.now()) / 1000);
+      setTimeLeft(remaining);
+      if (remaining <= 0) {
+        playTimerEndSound();
+        finishTimer(true);
+      }
+    }, 100);
+  };
+
+  const finishTimer = (auto: boolean) => {
+    stopClock();
+    const remaining = auto ? 0 : Math.max(0, (timerEndRef.current - Date.now()) / 1000);
+    const elapsed = timerDurationRef.current - remaining;
+    setPendingElapsed(Math.round(elapsed));
+    setPhase('revealed');
+  };
+
+  const judge = (result: 'correct' | 'wrong') => {
+    setPendingJudge(result);
+    setPhase('pickPlayer');
+  };
+
+  const pickPlayer = async (playerId: string) => {
+    const q = currentQ;
+    if (!q || !pendingJudge) return;
+    const rec = progress.get(q.position);
+    const attempts: GroupAttempt[] = rec ? [...rec.attempts] : [];
+    attempts.push({ n: attemptNum, time_s: pendingElapsed ?? 0, player_id: playerId, result: pendingJudge });
+
+    let final: 'correct' | 'wrong' | null = null;
+    let nextPhase: Phase;
+    let nextAttemptNum: 1 | 2 = attemptNum;
+
+    if (pendingJudge === 'correct') {
+      final = 'correct';
+      nextPhase = 'done';
+    } else if (attemptNum === 1) {
+      nextAttemptNum = 2;
+      nextPhase = 'idle';
+      setTimerDuration(10);
+    } else {
+      final = 'wrong';
+      nextPhase = 'done';
+    }
+
+    setProgress((prev) => {
+      const next = new Map(prev);
+      next.set(q.position, { attempts, final });
+      return next;
+    });
+    setAttemptNum(nextAttemptNum);
+    setPhase(nextPhase);
+    setPendingJudge(null);
+    setPendingElapsed(null);
+
+    try {
+      await saveQuestionProgress(round, q.position, attempts, final);
+      if (pendingJudge === 'correct') await awardGroupPoints(playerId, 5);
+    } catch {
+      /* best-effort — local UI already reflects the attempt */
+    }
+  };
+
+  const nextQuestionNav = () => goToQuestion(qIdx + 1);
+  const prevQuestionNav = () => goToQuestion(qIdx - 1);
+
+  const doResetQuestion = async () => {
+    const q = currentQ;
+    if (!q) return;
+    try { await resetQuestionApi(round, q.position); } catch { /* noop */ }
+    setProgress((prev) => { const next = new Map(prev); next.delete(q.position); return next; });
+    setPhase('idle');
+    setAttemptNum(1);
+    setTimerDuration(20);
+    setPendingJudge(null);
+    setPendingElapsed(null);
+  };
+
+  const confirmAndResetRound = async () => {
+    setConfirmResetRound(false);
+    try { await resetRoundApi(round); } catch { /* noop */ }
+    setProgress(new Map());
+    setQIdx(0);
+    setPhase('idle');
+    setAttemptNum(1);
+    setTimerDuration(20);
+    setPendingJudge(null);
+    setPendingElapsed(null);
+    setShowList(false);
+  };
+
   const timerColor = timeLeft > 10 ? '#10b981' : timeLeft > 5 ? '#f59e0b' : '#ef4444';
 
-  if (phase === 'pick-subject') {
+  // ── HOME ──────────────────────────────────────────────────────────────
+  if (view === 'home') {
     return (
       <div className="relative min-h-dvh flex flex-col pb-28">
         <div className="px-4 pt-12 pb-4">
           <h1 className="text-2xl font-black gradient-text" style={{ fontFamily: "'Tajawal',sans-serif" }}>التدريب الجماعي</h1>
-          <p className="text-white/35 text-sm mt-1" style={{ fontFamily: "'Tajawal',sans-serif" }}>اختر فرعاً للجلسة</p>
+          <p className="text-white/35 text-sm mt-1" style={{ fontFamily: "'Tajawal',sans-serif" }}>٥ جولات ثابتة — كمّل من حيث ما وقفت</p>
         </div>
-        {loadingSubjects ? (
-          <div className="px-4 grid grid-cols-2 gap-3 mt-2">
-            {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="rounded-2xl animate-glow-pulse" style={{ height: 72, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }} />
+        {loadingHome ? (
+          <div className="px-4 grid grid-cols-1 gap-3 mt-2">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <div key={i} className="rounded-2xl animate-glow-pulse" style={{ height: 96, background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }} />
             ))}
           </div>
         ) : (
-          <div className="px-4 grid grid-cols-2 gap-3 mt-2">
-            {subjects.map((s) => (
-              <button
-                key={s.id}
-                onClick={() => startSubject(s.id)}
-                disabled={loadingQuestions}
-                className="rounded-2xl p-4 text-right transition-all duration-200 hover:scale-[1.02] disabled:opacity-50"
-                style={{ background: `${s.color}15`, border: `1px solid ${s.color}30` }}
-              >
-                <p className="font-bold text-white text-sm" style={{ fontFamily: "'Tajawal',sans-serif" }}>{s.name}</p>
-                <p className="text-white/30 text-xs font-exo mt-0.5">الجولة {roundPreview[s.id] ?? '...'}</p>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  if (phase === 'no-questions') {
-    return (
-      <div className="relative min-h-dvh flex flex-col items-center justify-center gap-4 px-6 text-center">
-        <p className="text-4xl">🧩</p>
-        <p className="text-white font-bold" style={{ fontFamily: "'Tajawal',sans-serif" }}>
-          لسه مفيش أسئلة جماعية لهذا الفرع
-        </p>
-        <p className="text-white/30 text-sm" style={{ fontFamily: "'Tajawal',sans-serif" }}>
-          أضف أسئلة في جدول group_round_questions على Supabase
-        </p>
-        <button
-          onClick={() => { setPhase('pick-subject'); setSubjectId(''); setSubject(null); }}
-          className="mt-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white"
-          style={{ background: 'linear-gradient(135deg,#3b82f6,#8b5cf6)' }}
-        >
-          رجوع للفروع
-        </button>
-      </div>
-    );
-  }
-
-  if (phase === 'round-summary' && showSummary && subject) {
-    return (
-      <RoundSummary
-        entries={entries}
-        questions={questions}
-        subject={subject}
-        users={allUsers}
-        onClose={() => { setPhase('pick-subject'); setSubjectId(''); setSubject(null); setShowSummary(false); }}
-      />
-    );
-  }
-
-  if (loadingQuestions || !currentQ || !subject) {
-    return (
-      <div className="relative min-h-dvh flex items-center justify-center">
-        <div className="w-8 h-8 rounded-full animate-spin-slow" style={{ border: '3px solid rgba(255,255,255,0.15)', borderTopColor: '#60a5fa' }} />
-      </div>
-    );
-  }
-
-  const isAnswerPhase = phase === 'timer' || phase === 'timer2';
-
-  return (
-    <div className="relative min-h-dvh flex flex-col pb-28 overflow-hidden">
-      {/* Header */}
-      <div className="px-4 pt-10 pb-3 flex items-center gap-3">
-        <button
-          onClick={() => { stopTimer(); setPhase('pick-subject'); setSubjectId(''); setSubject(null); }}
-          className="w-9 h-9 rounded-xl flex items-center justify-center glass-md"
-          style={{ color: subject.color }}
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="9 18 15 12 9 6"/>
-          </svg>
-        </button>
-        <div className="flex-1">
-          <p className="text-sm font-bold" style={{ color: subject.color, fontFamily: "'Tajawal',sans-serif" }}>{subject.name} — جولة {roundNo}</p>
-          <p className="text-white/30 text-xs font-exo">{qIdx + 1} / {questions.length}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="text-green-400 text-sm font-bold font-exo">{entries.filter((e) => e.correct).length}</span>
-          <span className="text-white/20 text-xs">/</span>
-          <span className="text-white/40 text-sm font-exo">{entries.length}</span>
-        </div>
-        <button onClick={() => setShowSidebar(!showSidebar)} className="w-9 h-9 rounded-xl flex items-center justify-center glass-md">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.6)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
-          </svg>
-        </button>
-      </div>
-
-      <div className="px-4 flex-1 flex flex-col gap-4 overflow-y-auto">
-        {/* Question card */}
-        <div
-          className="rounded-2xl p-5"
-          style={{ background: `${subject.color}0e`, border: `1px solid ${subject.color}25`, boxShadow: `0 4px 24px ${subject.glow}` }}
-        >
-          <p className="text-lg font-bold text-white text-center" style={{ fontFamily: "'Tajawal',sans-serif", direction: 'rtl' }}>
-            {currentQ.question}
-          </p>
-        </div>
-
-        {/* Ready / Timer states */}
-        {phase === 'ready' && (
-          <button
-            onClick={beginTimer}
-            className="w-full rounded-2xl py-5 font-black text-white text-xl"
-            style={{ background: `linear-gradient(135deg,${subject.gradFrom},${subject.gradTo})`, boxShadow: `0 0 28px ${subject.glow}`, fontFamily: "'Tajawal',sans-serif" }}
-          >
-            ابدأ التايمر
-          </button>
-        )}
-
-        {(phase === 'timer' || phase === 'timer2' || phase === 'grace' || phase === 'grace2') && (
-          <div className="flex flex-col items-center gap-4">
-            {/* Timer ring */}
-            <div className="relative w-24 h-24">
-              <svg className="absolute inset-0 -rotate-90" width="96" height="96" viewBox="0 0 96 96">
-                <circle className="timer-track" cx="48" cy="48" r="44" strokeWidth="4"/>
-                <circle
-                  className="timer-fill"
-                  cx="48" cy="48" r="44"
-                  strokeWidth="4"
-                  stroke={timerColor}
-                  strokeDasharray="276.46"
-                  strokeDashoffset={276.46 - (timeLeft / timerMax) * 276.46}
-                  style={{ filter: `drop-shadow(0 0 6px ${timerColor})` }}
-                />
-              </svg>
-              <div className="absolute inset-0 flex flex-col items-center justify-center">
-                <span className="text-2xl font-black font-exo" style={{ color: timerColor, textShadow: `0 0 10px ${timerColor}` }}>{timeLeft}</span>
-                <span className="text-white/30 text-[9px] font-exo">{phase === 'timer' ? 'جولة ١' : phase === 'timer2' ? 'جولة ٢' : 'وقت'}</span>
-              </div>
-            </div>
-
-            {isAnswerPhase && (
-              <button
-                onClick={handleAnswerButton}
-                className="w-full rounded-2xl py-4 font-black text-white text-base"
-                style={{ background: `linear-gradient(135deg,${subject.gradFrom},${subject.gradTo})`, boxShadow: `0 0 20px ${subject.glow}`, fontFamily: "'Tajawal',sans-serif" }}
-              >
-                إجابة
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* Reveal correct answer */}
-        {(phase === 'reveal' || phase === 'second-reveal') && (
-          <div className="flex flex-col gap-3 animate-slide-up">
-            <div className="rounded-2xl p-4" style={{ background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)' }}>
-              <p className="text-green-400/60 text-xs mb-1" style={{ fontFamily: "'Tajawal',sans-serif" }}>الإجابة الصحيحة</p>
-              <p className="text-white font-bold text-base" style={{ fontFamily: "'Tajawal',sans-serif" }}>{currentQ.answer}</p>
-            </div>
-
-            {/* Elapsed */}
-            {elapsed > 0 && (
-              <p className="text-white/30 text-xs text-center font-exo">
-                وقت الإجابة: {(elapsed / 1000).toFixed(1)}s
-              </p>
-            )}
-
-            <div className="grid grid-cols-2 gap-3">
-              <button
-                onClick={handleCorrect}
-                className="rounded-xl py-3.5 font-bold text-base"
-                style={{ background: 'rgba(16,185,129,0.15)', border: '1px solid rgba(16,185,129,0.4)', color: '#34d399', fontFamily: "'Tajawal',sans-serif", boxShadow: '0 0 16px rgba(16,185,129,0.25)' }}
-              >
-                صح
-              </button>
-              <button
-                onClick={handleWrong}
-                className="rounded-xl py-3.5 font-bold text-base"
-                style={{ background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#f87171', fontFamily: "'Tajawal',sans-serif", boxShadow: '0 0 16px rgba(239,68,68,0.25)' }}
-              >
-                {phase === 'reveal' ? 'غلط (جولة ٢)' : 'غلط'}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Assign to member */}
-        {phase === 'assign-member' && (
-          <div className="flex flex-col gap-3 animate-slide-up">
-            <p className="text-white/50 text-sm text-center" style={{ fontFamily: "'Tajawal',sans-serif" }}>من أجاب؟</p>
-
-            {/* Right row */}
-            <div className="grid grid-cols-4 gap-2">
-              {rightRow.map((u) => (
-                <button
-                  key={u.id}
-                  onClick={() => assignMember(u.id)}
-                  className="rounded-xl py-3 flex flex-col items-center gap-1 transition-all duration-200 hover:scale-[1.04]"
-                  style={{ background: `${u.color}15`, border: `1px solid ${u.color}30` }}
-                >
-                  <span className="text-xs font-bold text-white" style={{ fontFamily: "'Tajawal',sans-serif" }}>{u.name}</span>
-                </button>
-              ))}
-            </div>
-
-            {/* Left row */}
-            <div className="grid grid-cols-4 gap-2">
-              {leftRow.map((u) => (
-                <button
-                  key={u.id}
-                  onClick={() => assignMember(u.id)}
-                  className="rounded-xl py-3 flex flex-col items-center gap-1 transition-all duration-200 hover:scale-[1.04]"
-                  style={{ background: `${u.color}15`, border: `1px solid ${u.color}30` }}
-                >
-                  <span className="text-xs font-bold text-white" style={{ fontFamily: "'Tajawal',sans-serif" }}>{u.name}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Nav arrows */}
-      <div className="fixed bottom-24 left-0 right-0 flex justify-center gap-4 px-4 z-30">
-        <button
-          onClick={() => { if (qIdx > 0) { stopTimer(); setQIdx((q) => q - 1); setPhase('ready'); } }}
-          disabled={qIdx === 0}
-          className="w-10 h-10 rounded-xl flex items-center justify-center glass disabled:opacity-20"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-        </button>
-        <button
-          onClick={() => { stopTimer(); nextQuestion(); }}
-          disabled={qIdx >= questions.length - 1}
-          className="w-10 h-10 rounded-xl flex items-center justify-center glass disabled:opacity-20"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
-        </button>
-      </div>
-
-      {showSidebar && subject && (
-        <GroupSidebar questions={questions} currentIdx={qIdx} entries={entries} subject={subject}
-          onSelect={(i) => { stopTimer(); setQIdx(i); setPhase('ready'); setShowSidebar(false); }}
-          onClose={() => setShowSidebar(false)} />
-      )}
-    </div>
-  );
-}
-
-// ── Round Summary ──────────────────────────────────────────────────────────
-function RoundSummary({ entries, questions, subject, users, onClose }: {
-  entries: RoundEntry[];
-  questions: GroupQuestion[];
-  subject: Subject;
-  users: User[];
-  onClose: () => void;
-}) {
-  const correct = entries.filter((e) => e.correct);
-  const wrong   = entries.filter((e) => !e.correct);
-  const avgAll  = entries.length ? (entries.reduce((a, e) => a + e.timeMs, 0) / entries.length / 1000).toFixed(1) : '—';
-  const avgOk   = correct.length ? (correct.reduce((a, e) => a + e.timeMs, 0) / correct.length / 1000).toFixed(1) : '—';
-  const avgBad  = wrong.length ? (wrong.reduce((a, e) => a + e.timeMs, 0) / wrong.length / 1000).toFixed(1) : '—';
-
-  // Per-member scores
-  const memberMap: Record<string, number> = {};
-  entries.forEach((e) => { if (e.memberId && e.correct) memberMap[e.memberId] = (memberMap[e.memberId] ?? 0) + 1; });
-
-  return (
-    <div className="relative min-h-dvh flex flex-col pb-28 overflow-y-auto">
-      <div className="px-4 pt-12 pb-4 flex items-center gap-3">
-        <button onClick={onClose} className="w-9 h-9 rounded-xl flex items-center justify-center glass-md" style={{ color: subject.color }}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>
-        <h1 className="text-xl font-black text-white" style={{ fontFamily: "'Tajawal',sans-serif" }}>ملخص الجولة</h1>
-      </div>
-
-      <div className="px-4 flex flex-col gap-4">
-        {/* Stats row */}
-        <div className="grid grid-cols-3 gap-3">
-          {[
-            { label: 'صحيحة', value: correct.length, color: '#34d399' },
-            { label: 'خاطئة', value: wrong.length, color: '#f87171' },
-            { label: 'المجموع', value: entries.length, color: '#60a5fa' },
-          ].map((s) => (
-            <div key={s.label} className="rounded-2xl p-3 text-center" style={{ background: `${s.color}0e`, border: `1px solid ${s.color}25` }}>
-              <p className="text-2xl font-black font-exo" style={{ color: s.color }}>{s.value}</p>
-              <p className="text-white/40 text-xs mt-0.5" style={{ fontFamily: "'Tajawal',sans-serif" }}>{s.label}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Speed stats */}
-        <div className="glass-md rounded-2xl p-4">
-          <p className="text-white/50 text-xs mb-3" style={{ fontFamily: "'Tajawal',sans-serif" }}>متوسط السرعة</p>
-          {[
-            { label: 'الكلية', value: avgAll, color: '#60a5fa' },
-            { label: 'الصحيحة', value: avgOk, color: '#34d399' },
-            { label: 'الخاطئة', value: avgBad, color: '#f87171' },
-          ].map((s) => (
-            <div key={s.label} className="flex items-center justify-between py-1.5 border-b border-white/5 last:border-0">
-              <span className="text-white/50 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>{s.label}</span>
-              <span className="font-bold text-sm font-exo" style={{ color: s.color }}>{s.value}s</span>
-            </div>
-          ))}
-        </div>
-
-        {/* Per-member */}
-        {Object.keys(memberMap).length > 0 && (
-          <div className="glass-md rounded-2xl p-4">
-            <p className="text-white/50 text-xs mb-3" style={{ fontFamily: "'Tajawal',sans-serif" }}>الإجابات الصحيحة بالأعضاء</p>
-            {Object.entries(memberMap).sort((a, b) => b[1] - a[1]).map(([uid, count]) => {
-              const u = users.find((u) => u.id === uid);
-              if (!u) return null;
+          <div className="px-4 flex flex-col gap-3 mt-2">
+            {ALL_ROUNDS.map((r) => {
+              const s = roundsSummary[r] ?? { total: 0, answered: 0 };
+              const pct = s.total ? Math.round((s.answered / s.total) * 100) : 0;
               return (
-                <div key={uid} className="flex items-center justify-between py-2 border-b border-white/5 last:border-0">
-                  <span className="text-white font-bold text-sm" style={{ fontFamily: "'Tajawal',sans-serif", color: u.color }}>{u.name}</span>
-                  <span className="font-bold font-exo text-sm text-green-400">{count}</span>
+                <div key={r} className="glass-md rounded-2xl p-4">
+                  <p className="font-black text-lg text-white" style={{ fontFamily: "'Tajawal',sans-serif" }}>الجولة {ROUND_LABELS[r]}</p>
+                  <p className="text-white/35 text-xs mt-0.5 font-exo">{s.answered} / {s.total} تم الإجابة عليها</p>
+                  <div className="h-1.5 rounded-full overflow-hidden mt-2.5 mb-3" style={{ background: 'rgba(255,255,255,0.06)' }}>
+                    <div className="h-full rounded-full" style={{ width: `${pct}%`, background: `linear-gradient(90deg,${GRAD_FROM},${GRAD_TO})` }} />
+                  </div>
+                  <div className="flex gap-2.5">
+                    <button
+                      onClick={() => openRound(r)}
+                      className="flex-1 rounded-xl py-2.5 text-sm font-bold text-white"
+                      style={{ background: `linear-gradient(135deg,${GRAD_FROM},${GRAD_TO})`, boxShadow: `0 0 16px rgba(59,130,246,0.35)`, fontFamily: "'Tajawal',sans-serif" }}
+                    >
+                      {s.answered > 0 ? 'متابعة' : 'ابدأ'}
+                    </button>
+                    <button
+                      onClick={() => openStats(r)}
+                      className="flex-1 rounded-xl py-2.5 text-sm font-bold glass-md"
+                      style={{ color: ACCENT, fontFamily: "'Tajawal',sans-serif" }}
+                    >
+                      الإحصائيات
+                    </button>
+                  </div>
                 </div>
               );
             })}
           </div>
         )}
+      </div>
+    );
+  }
 
-        {/* Correct list */}
-        <div className="glass-md rounded-2xl p-4">
-          <p className="text-green-400/70 text-xs mb-3" style={{ fontFamily: "'Tajawal',sans-serif" }}>الإجابات الصحيحة</p>
-          {correct.map((e) => (
-            <div key={e.qIdx} className="py-2 border-b border-white/5 last:border-0">
-              <p className="text-white/70 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>{questions[e.qIdx]?.question}</p>
-              <p className="text-green-400 text-xs font-bold mt-0.5" style={{ fontFamily: "'Tajawal',sans-serif" }}>↳ {questions[e.qIdx]?.answer}</p>
-            </div>
+  // ── STATS ─────────────────────────────────────────────────────────────
+  if (view === 'stats') {
+    if (loadingStats || !statsData) {
+      return (
+        <div className="relative min-h-dvh flex items-center justify-center">
+          <div className="w-8 h-8 rounded-full animate-spin-slow" style={{ border: '3px solid rgba(255,255,255,0.15)', borderTopColor: ACCENT }} />
+        </div>
+      );
+    }
+    const s = computeRoundStats(statsData.questions, statsData.progress, allUsers);
+    return (
+      <div className="relative min-h-dvh flex flex-col pb-28 overflow-y-auto">
+        <div className="px-4 pt-12 pb-4 flex items-center gap-2 flex-wrap">
+          <button onClick={goHome} className="text-xs px-3 py-1.5 rounded-lg glass-md" style={{ color: ACCENT, fontFamily: "'Tajawal',sans-serif" }}>الرئيسية</button>
+          <button onClick={() => openRound(statsRound)} className="text-xs px-3 py-1.5 rounded-lg glass-md" style={{ color: ACCENT, fontFamily: "'Tajawal',sans-serif" }}>الرجوع للجولة</button>
+          {ALL_ROUNDS.filter((r) => r !== statsRound).map((r) => (
+            <button key={r} onClick={() => openStats(r)} className="text-xs px-3 py-1.5 rounded-lg glass-md text-white/50" style={{ fontFamily: "'Tajawal',sans-serif" }}>
+              إحصائيات {ROUND_LABELS[r]}
+            </button>
           ))}
-          {correct.length === 0 && <p className="text-white/25 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>—</p>}
+          <button
+            onClick={() => setConfirmResetRound(true)}
+            className="text-xs px-3 py-1.5 rounded-lg"
+            style={{ background: 'rgba(239,68,68,0.12)', color: '#f87171', border: '1px solid rgba(239,68,68,0.25)', fontFamily: "'Tajawal',sans-serif" }}
+          >
+            ريسيت الجولة
+          </button>
         </div>
 
-        {/* Wrong list */}
-        <div className="glass-md rounded-2xl p-4 mb-2">
-          <p className="text-red-400/70 text-xs mb-3" style={{ fontFamily: "'Tajawal',sans-serif" }}>الإجابات الخاطئة</p>
-          {wrong.map((e) => (
-            <div key={e.qIdx} className="py-2 border-b border-white/5 last:border-0">
-              <p className="text-white/70 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>{questions[e.qIdx]?.question}</p>
-              <p className="text-red-400 text-xs font-bold mt-0.5" style={{ fontFamily: "'Tajawal',sans-serif" }}>↳ {questions[e.qIdx]?.answer}</p>
+        <div className="px-4">
+          <h2 className="text-xl font-black text-white mb-3" style={{ fontFamily: "'Tajawal',sans-serif" }}>إحصائيات الجولة {ROUND_LABELS[statsRound]}</h2>
+
+          <div className="glass-md rounded-2xl p-4 mb-4">
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div><p className="text-2xl font-black font-exo text-green-400">{s.correctCount}</p><p className="text-white/35 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>إجابات صحيحة</p></div>
+              <div><p className="text-2xl font-black font-exo text-red-400">{s.wrongCount}</p><p className="text-white/35 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>إجابات خاطئة</p></div>
+              <div><p className="text-2xl font-black font-exo text-white">{s.answeredCount}/{s.total}</p><p className="text-white/35 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>تم الإجابة</p></div>
             </div>
-          ))}
-          {wrong.length === 0 && <p className="text-white/25 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>—</p>}
+            <div className="h-px bg-white/5 my-3" />
+            <p className="text-white/40 text-xs" style={{ fontFamily: "'Tajawal',sans-serif" }}>متوسط سرعة الإجابة العامة: <span className="font-exo text-white/70">{fmt(s.avgOverall)}</span></p>
+            <p className="text-white/40 text-xs mt-1" style={{ fontFamily: "'Tajawal',sans-serif" }}>متوسط سرعة الإجابات الصحيحة: <span className="font-exo text-green-400">{fmt(s.avgCorrect)}</span></p>
+            <p className="text-white/40 text-xs mt-1" style={{ fontFamily: "'Tajawal',sans-serif" }}>متوسط سرعة الإجابات الخاطئة: <span className="font-exo text-red-400">{fmt(s.avgWrong)}</span></p>
+
+            <div className="grid grid-cols-2 gap-3 mt-4">
+              <div>
+                <p className="text-white/40 text-xs font-bold mb-1.5" style={{ fontFamily: "'Tajawal',sans-serif" }}>قائمة الإجابات الصحيحة</p>
+                <div className="max-h-40 overflow-y-auto text-xs text-white/50 leading-7 pl-3" style={{ fontFamily: "'Tajawal',sans-serif" }}>
+                  {s.correctList.length ? s.correctList.map((q, i) => <p key={i}>{q}</p>) : <p>—</p>}
+                </div>
+              </div>
+              <div>
+                <p className="text-white/40 text-xs font-bold mb-1.5" style={{ fontFamily: "'Tajawal',sans-serif" }}>قائمة الإجابات الخاطئة</p>
+                <div className="max-h-40 overflow-y-auto text-xs text-white/50 leading-7 pl-3" style={{ fontFamily: "'Tajawal',sans-serif" }}>
+                  {s.wrongList.length ? s.wrongList.map((q, i) => <p key={i}>{q}</p>) : <p>—</p>}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            {allUsers.map((u) => {
+              const ps = s.playerStats[u.id] ?? { correct: 0, wrong: 0, correctTimes: [], wrongTimes: [], allTimes: [] };
+              const avg = (arr: number[]) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+              return (
+                <div key={u.id} className="glass-md rounded-2xl p-3.5">
+                  <p className="font-bold text-sm" style={{ color: u.color, fontFamily: "'Tajawal',sans-serif" }}>{u.name}</p>
+                  <div className="flex items-center gap-4 mt-2">
+                    <div><p className="text-lg font-black font-exo text-green-400">{ps.correct}</p><p className="text-white/30 text-[10px]">صح</p></div>
+                    <div><p className="text-lg font-black font-exo text-red-400">{ps.wrong}</p><p className="text-white/30 text-[10px]">غلط</p></div>
+                  </div>
+                  <p className="text-white/25 text-[10px] mt-2 font-exo">
+                    صح: {fmt(avg(ps.correctTimes))} · غلط: {fmt(avg(ps.wrongTimes))} · عام: {fmt(avg(ps.allTimes))}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {confirmResetRound && (
+          <ResetConfirmModal onConfirm={confirmAndResetRound} onCancel={() => setConfirmResetRound(false)} />
+        )}
+      </div>
+    );
+  }
+
+  // ── ROUND ─────────────────────────────────────────────────────────────
+  if (loadingRound || !currentQ) {
+    return (
+      <div className="relative min-h-dvh flex items-center justify-center">
+        <div className="w-8 h-8 rounded-full animate-spin-slow" style={{ border: '3px solid rgba(255,255,255,0.15)', borderTopColor: ACCENT }} />
+      </div>
+    );
+  }
+
+  const rec = progress.get(currentQ.position);
+
+  return (
+    <div className="relative min-h-dvh flex flex-col pb-28 overflow-hidden">
+      {/* Top actions */}
+      <div className="px-4 pt-10 pb-2 flex items-center gap-2 flex-wrap">
+        <button onClick={goHome} className="text-xs px-3 py-1.5 rounded-lg glass-md" style={{ color: ACCENT, fontFamily: "'Tajawal',sans-serif" }}>الرئيسية</button>
+        <button onClick={() => setShowList((v) => !v)} className="text-xs px-3 py-1.5 rounded-lg glass-md text-white/50" style={{ fontFamily: "'Tajawal',sans-serif" }}>قائمة الأسئلة</button>
+        <button onClick={() => openStats(round)} className="text-xs px-3 py-1.5 rounded-lg glass-md text-white/50" style={{ fontFamily: "'Tajawal',sans-serif" }}>الإحصائيات</button>
+        <button
+          onClick={() => setConfirmResetRound(true)}
+          className="text-xs px-3 py-1.5 rounded-lg"
+          style={{ background: 'rgba(239,68,68,0.12)', color: '#f87171', border: '1px solid rgba(239,68,68,0.25)', fontFamily: "'Tajawal',sans-serif" }}
+        >
+          ريسيت الجولة
+        </button>
+      </div>
+
+      {/* Question list overlay */}
+      {showList && (
+        <div className="px-4 mb-2">
+          <div className="glass-md rounded-2xl p-3 grid grid-cols-6 gap-1.5 max-h-64 overflow-y-auto">
+            {questions.map((q, i) => {
+              const r = progress.get(q.position);
+              const cur = i === qIdx;
+              return (
+                <button
+                  key={q.id}
+                  onClick={() => goToQuestion(i)}
+                  className="rounded-lg py-2 text-xs font-bold text-center"
+                  style={{
+                    background: r?.final === 'correct' ? '#10b981' : r?.final === 'wrong' ? '#ef4444' : 'rgba(255,255,255,0.05)',
+                    color: r?.final ? 'white' : 'rgba(255,255,255,0.4)',
+                    outline: cur ? `2px solid ${ACCENT}` : 'none',
+                    fontFamily: "'Exo 2',sans-serif",
+                  }}
+                >
+                  {i + 1}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Header row: question count + nav arrows */}
+      <div className="px-4 flex items-center justify-between mb-2">
+        <span className="text-white/35 text-xs font-exo">الجولة {ROUND_LABELS[round]} — سؤال {qIdx + 1} من {questions.length}</span>
+        <div className="flex gap-2">
+          <button onClick={prevQuestionNav} disabled={qIdx === 0} className="w-8 h-8 rounded-lg flex items-center justify-center glass-md disabled:opacity-20">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <button onClick={nextQuestionNav} disabled={qIdx === questions.length - 1} className="w-8 h-8 rounded-lg flex items-center justify-center glass-md disabled:opacity-20">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div className="px-4 flex-1 flex flex-col gap-4">
+        <div className="rounded-2xl p-5" style={{ background: `${ACCENT}0e`, border: `1px solid ${ACCENT}25`, boxShadow: `0 4px 24px rgba(59,130,246,0.25)` }}>
+          <p className="text-lg font-bold text-white text-center leading-snug" style={{ fontFamily: "'Tajawal',sans-serif", direction: 'rtl' }}>
+            {currentQ.question}
+          </p>
+          {phase === 'idle' && attemptNum === 2 && (
+            <p className="text-center text-amber-400 text-xs mt-3" style={{ fontFamily: "'Tajawal',sans-serif" }}>فرصة ثانية</p>
+          )}
+        </div>
+
+        {phase === 'idle' && (
+          <button
+            onClick={startTimer}
+            className="w-full rounded-2xl py-5 font-black text-white text-lg"
+            style={{ background: `linear-gradient(135deg,${GRAD_FROM},${GRAD_TO})`, boxShadow: `0 0 28px rgba(59,130,246,0.5)`, fontFamily: "'Tajawal',sans-serif" }}
+          >
+            ابدأ التايمر ({attemptNum === 1 ? 20 : 10} ث)
+          </button>
+        )}
+
+        {phase === 'running' && (
+          <div className="flex flex-col items-center gap-4">
+            <div className="relative w-24 h-24">
+              <svg className="absolute inset-0 -rotate-90" width="96" height="96" viewBox="0 0 96 96">
+                <circle className="timer-track" cx="48" cy="48" r="44" strokeWidth="4"/>
+                <circle
+                  cx="48" cy="48" r="44" strokeWidth="4" fill="none"
+                  stroke={timerColor}
+                  strokeDasharray="276.46"
+                  strokeDashoffset={276.46 - (timeLeft / timerDuration) * 276.46}
+                  style={{ filter: `drop-shadow(0 0 6px ${timerColor})`, transition: 'stroke-dashoffset 0.1s linear' }}
+                />
+              </svg>
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="text-2xl font-black font-exo" style={{ color: timerColor, textShadow: `0 0 10px ${timerColor}` }}>{Math.ceil(timeLeft)}</span>
+              </div>
+            </div>
+            <button
+              onClick={() => finishTimer(false)}
+              className="w-full rounded-2xl py-4 font-black text-white text-base"
+              style={{ background: 'linear-gradient(135deg,#ef4444,#f97316)', boxShadow: '0 0 20px rgba(239,68,68,0.4)', fontFamily: "'Tajawal',sans-serif" }}
+            >
+              إجابة
+            </button>
+          </div>
+        )}
+
+        {phase === 'revealed' && (
+          <div className="flex flex-col gap-3 animate-slide-up">
+            <div className="rounded-2xl p-4" style={{ background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)' }}>
+              <p className="text-green-400/60 text-xs mb-1" style={{ fontFamily: "'Tajawal',sans-serif" }}>الإجابة الصحيحة</p>
+              <p className="text-white font-bold text-base" style={{ fontFamily: "'Tajawal',sans-serif" }}>{currentQ.answer}</p>
+              <p className="text-white/30 text-xs mt-2 font-exo">الوقت المسجل: {fmt(pendingElapsed)}</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={() => judge('correct')} className="rounded-xl py-3.5 font-bold text-base" style={{ background: 'rgba(16,185,129,0.15)', border: '1px solid rgba(16,185,129,0.4)', color: '#34d399', fontFamily: "'Tajawal',sans-serif" }}>إجابة صحيحة</button>
+              <button onClick={() => judge('wrong')} className="rounded-xl py-3.5 font-bold text-base" style={{ background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#f87171', fontFamily: "'Tajawal',sans-serif" }}>إجابة خاطئة</button>
+            </div>
+          </div>
+        )}
+
+        {phase === 'pickPlayer' && (
+          <div className="flex flex-col gap-3 animate-slide-up">
+            <p className="text-white/50 text-sm text-center" style={{ fontFamily: "'Tajawal',sans-serif" }}>مين اللي جاوب؟</p>
+            <div className="grid grid-cols-4 gap-2">
+              {rightRow.map((u) => (
+                <button key={u.id} onClick={() => pickPlayer(u.id)} className="rounded-xl py-3 text-xs font-bold text-white" style={{ background: `${u.color}18`, border: `1px solid ${u.color}30` }}>{u.name}</button>
+              ))}
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              {leftRow.map((u) => (
+                <button key={u.id} onClick={() => pickPlayer(u.id)} className="rounded-xl py-3 text-xs font-bold text-white" style={{ background: `${u.color}18`, border: `1px solid ${u.color}30` }}>{u.name}</button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {phase === 'done' && rec && (
+          <div className="flex flex-col gap-3 animate-slide-up">
+            <div className="rounded-2xl p-4" style={{ background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)' }}>
+              <p className="text-green-400/60 text-xs mb-1" style={{ fontFamily: "'Tajawal',sans-serif" }}>الإجابة الصحيحة</p>
+              <p className="text-white font-bold text-base" style={{ fontFamily: "'Tajawal',sans-serif" }}>{currentQ.answer}</p>
+              <div className="flex flex-col gap-1.5 mt-3">
+                {rec.attempts.map((a, i) => {
+                  const player = allUsers.find((u) => u.id === a.player_id);
+                  return (
+                    <div
+                      key={i}
+                      className="flex items-center justify-between text-xs px-3 py-2 rounded-lg"
+                      style={{ background: a.result === 'correct' ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)', color: a.result === 'correct' ? '#34d399' : '#f87171' }}
+                    >
+                      <span>محاولة {a.n} — {player?.name ?? '؟'}</span>
+                      <span className="font-exo">{a.result === 'correct' ? 'صح' : 'غلط'} · {fmt(a.time_s)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              {qIdx < questions.length - 1 ? (
+                <button onClick={nextQuestionNav} className="rounded-xl py-3.5 font-bold text-white text-sm" style={{ background: `linear-gradient(135deg,${GRAD_FROM},${GRAD_TO})`, fontFamily: "'Tajawal',sans-serif" }}>التالي</button>
+              ) : (
+                <button onClick={() => openStats(round)} className="rounded-xl py-3.5 font-bold text-white text-sm" style={{ background: 'linear-gradient(135deg,#10b981,#06b6d4)', fontFamily: "'Tajawal',sans-serif" }}>انتهت الجولة — الإحصائيات</button>
+              )}
+              <button onClick={doResetQuestion} className="rounded-xl py-3.5 font-bold text-sm glass-md text-white/50" style={{ fontFamily: "'Tajawal',sans-serif" }}>إعادة السؤال</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {confirmResetRound && (
+        <ResetConfirmModal onConfirm={confirmAndResetRound} onCancel={() => setConfirmResetRound(false)} />
+      )}
+    </div>
+  );
+}
+
+function ResetConfirmModal({ onConfirm, onCancel }: { onConfirm: () => void; onCancel: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: 'rgba(0,0,0,0.6)' }} onClick={onCancel}>
+      <div className="glass-md rounded-2xl p-5 max-w-xs w-full" onClick={(e) => e.stopPropagation()}>
+        <p className="text-white font-bold text-sm text-center mb-2" style={{ fontFamily: "'Tajawal',sans-serif" }}>تأكيد إعادة تعيين الجولة</p>
+        <p className="text-white/40 text-xs text-center mb-4" style={{ fontFamily: "'Tajawal',sans-serif" }}>
+          هيتم مسح كل الإجابات (والنقاط المرتبطة بيها) والبدء من السؤال الأول. مفيش رجوع بعد كده.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <button onClick={onConfirm} className="rounded-xl py-2.5 text-sm font-bold text-white" style={{ background: 'linear-gradient(135deg,#ef4444,#f97316)', fontFamily: "'Tajawal',sans-serif" }}>تأكيد</button>
+          <button onClick={onCancel} className="rounded-xl py-2.5 text-sm font-bold text-white/60 glass-md" style={{ fontFamily: "'Tajawal',sans-serif" }}>إلغاء</button>
         </div>
       </div>
     </div>
   );
 }
 
-// ── Group Sidebar ──────────────────────────────────────────────────────────
-function GroupSidebar({ questions, currentIdx, entries, subject, onSelect, onClose }: {
-  questions: GroupQuestion[];
-  currentIdx: number;
-  entries: RoundEntry[];
-  subject: Subject;
-  onSelect: (i: number) => void;
-  onClose: () => void;
-}) {
-  const doneMap: Record<number, boolean> = {};
-  entries.forEach((e) => { doneMap[e.qIdx] = e.correct; });
+// ── Stats computation (mirrors the reference logic exactly) ────────────────
+interface PlayerRoundStats {
+  correct: number;
+  wrong: number;
+  correctTimes: number[];
+  wrongTimes: number[];
+  allTimes: number[];
+}
 
-  return (
-    <div className="fixed inset-0 z-50 flex" onClick={onClose}>
-      <div className="flex-1" />
-      <div
-        className="h-full w-72 flex flex-col overflow-hidden"
-        style={{ background: 'rgba(6,9,26,0.97)', backdropFilter: 'blur(24px)', borderRight: `1px solid ${subject.color}20` }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-4 pt-12 pb-4" style={{ borderBottom: `1px solid ${subject.color}15` }}>
-          <p className="font-bold text-white text-sm" style={{ fontFamily: "'Tajawal',sans-serif" }}>الأسئلة</p>
-          <button onClick={onClose} className="text-white/40 hover:text-white/80">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-          </button>
-        </div>
-        <div className="flex-1 overflow-y-auto px-3 py-2">
-          {questions.map((q, i) => {
-            const done = i in doneMap;
-            const ok = doneMap[i];
-            const cur = i === currentIdx;
-            return (
-              <button
-                key={q.id}
-                onClick={() => onSelect(i)}
-                className="w-full text-right rounded-xl px-3 py-2.5 mb-1.5 flex items-center gap-2.5 transition-all"
-                style={{
-                  background: cur ? `${subject.color}15` : done ? (ok ? 'rgba(16,185,129,0.07)' : 'rgba(239,68,68,0.07)') : 'rgba(255,255,255,0.03)',
-                  border: `1px solid ${cur ? subject.color + '40' : done ? (ok ? 'rgba(16,185,129,0.2)' : 'rgba(239,68,68,0.2)') : 'rgba(255,255,255,0.06)'}`,
-                }}
-              >
-                <span className="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold font-exo"
-                  style={{ background: done ? (ok ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)') : 'rgba(255,255,255,0.06)', color: done ? (ok ? '#34d399' : '#f87171') : 'rgba(255,255,255,0.3)' }}>
-                  {done ? (ok ? '✓' : '✗') : i + 1}
-                </span>
-                <span className="flex-1 text-xs text-white/60 truncate" style={{ fontFamily: "'Tajawal',sans-serif" }}>
-                  {q.question.slice(0, 40)}...
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
+function computeRoundStats(questions: GroupQuestion[], progress: Map<number, ProgressRecord>, users: User[]) {
+  const correctList: string[] = [];
+  const wrongList: string[] = [];
+  const allTimes: number[] = [];
+  const correctTimes: number[] = [];
+  const wrongTimes: number[] = [];
+  const playerStats: Record<string, PlayerRoundStats> = {};
+  users.forEach((u) => { playerStats[u.id] = { correct: 0, wrong: 0, correctTimes: [], wrongTimes: [], allTimes: [] }; });
+
+  questions.forEach((q) => {
+    const rec = progress.get(q.position);
+    if (!rec || !rec.final) return;
+    if (rec.final === 'correct') correctList.push(q.question); else wrongList.push(q.question);
+    rec.attempts.forEach((a) => {
+      allTimes.push(a.time_s);
+      if (a.result === 'correct') correctTimes.push(a.time_s); else wrongTimes.push(a.time_s);
+      const ps = playerStats[a.player_id];
+      if (ps) {
+        ps.allTimes.push(a.time_s);
+        if (a.result === 'correct') { ps.correct++; ps.correctTimes.push(a.time_s); }
+        else { ps.wrong++; ps.wrongTimes.push(a.time_s); }
+      }
+    });
+  });
+
+  const avg = (arr: number[]) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  return {
+    correctCount: correctList.length,
+    wrongCount: wrongList.length,
+    correctList,
+    wrongList,
+    avgOverall: avg(allTimes),
+    avgCorrect: avg(correctTimes),
+    avgWrong: avg(wrongTimes),
+    playerStats,
+    answeredCount: correctList.length + wrongList.length,
+    total: questions.length,
+  };
 }

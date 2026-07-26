@@ -6,6 +6,7 @@ import {
   getGroupSpeed,
   getRivalries,
   subscribeToPoints,
+  subscribeToGroupProgress,
   type UserDetailStats,
   type GroupRadarResult,
   type GroupSpeedRow,
@@ -49,10 +50,16 @@ export default function StatisticsPage({ navigate: _navigate }: StatisticsPagePr
       .catch(() => {})
       .finally(() => { if (!cancelled) setLoading(false); });
     // Keep the leaderboard fresh as points come in from anywhere in the app.
-    const unsub = subscribeToPoints(() => {
+    const unsubPoints = subscribeToPoints(() => {
       getLeaderboard().then((lb) => { if (!cancelled) setLeaderboard(lb); }).catch(() => {});
     });
-    return () => { cancelled = true; unsub(); };
+    // Keep group radar/speed/leaderboard counts fresh as rounds are played or reset.
+    const unsubGroup = subscribeToGroupProgress(() => {
+      Promise.all([getLeaderboard(), getGroupRadar(), getGroupSpeed()])
+        .then(([lb, r, sp]) => { if (!cancelled) { setLeaderboard(lb); setRadar(r); setSpeed(sp); } })
+        .catch(() => {});
+    });
+    return () => { cancelled = true; unsubPoints(); unsubGroup(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -79,7 +86,7 @@ export default function StatisticsPage({ navigate: _navigate }: StatisticsPagePr
       <div className="px-4 flex flex-col gap-6 overflow-y-auto">
 
         {/* ── Section 1: Radar charts ── */}
-        <Section title="مقارنة التدريب الجماعي" subtitle="الإجابات الصحيحة لكل فرع">
+        <Section title="مقارنة التدريب الجماعي" subtitle="الإجابات الصحيحة لكل جولة">
           {radar.rows.length === 0 ? (
             <EmptyNote text="لسه محدش لعب تدريب جماعي" />
           ) : (

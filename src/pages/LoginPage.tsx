@@ -27,8 +27,11 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
       .then((list) => {
         if (!cancelled) setUsers(list);
       })
-      .catch(() => {
-        if (!cancelled) setLoadError('تعذّر الاتصال بالخادم، حاول مرة أخرى');
+      .catch((err) => {
+        if (!cancelled) {
+          const detail = err?.message || err?.error_description || JSON.stringify(err);
+          setLoadError(`تعذّر الاتصال بالخادم: ${detail}`);
+        }
       })
       .finally(() => {
         if (!cancelled) setLoadingUsers(false);

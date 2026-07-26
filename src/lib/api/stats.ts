@@ -1,6 +1,6 @@
 import { supabase } from '../supabaseClient';
 import { getUsersByIds } from '../auth';
-import { getSubjectById } from './subjects';
+import type { GroupAttempt } from '../database.types';
 
 export interface UserDetailStats {
   userId: string;
@@ -23,9 +23,54 @@ export interface UserDetailStats {
   matchWins: number;
 }
 
-/** The whole leaderboard + per-member breakdown, ranked. Backed by v_user_detail. */
+const ROUND_NUMBERS = [1, 2, 3, 4, 5];
+const ROUND_LABELS: Record<number, string> = { 1: 'الجولة ١', 2: 'الجولة ٢', 3: 'الجولة ٣', 4: 'الجولة ٤', 5: 'الجولة ٥' };
+
+interface PlayerGroupAgg {
+  answered: number;
+  correct: number;
+  correctTimes: number[];
+  wrongTimes: number[];
+  allTimes: number[];
+}
+
+/**
+ * Group training now lives entirely in `group_progress` (5 fixed general-knowledge
+ * rounds, no subject). This aggregates every player's attempts across all rounds —
+ * shared by the leaderboard's group-answered/correct counts and the speed chart.
+ */
+async function getGroupAttemptsAggByPlayer(): Promise<Map<string, PlayerGroupAgg>> {
+  const { data, error } = await supabase.from('group_progress').select('attempts');
+  if (error) throw error;
+  const rows = data ?? [];
+
+  const map = new Map<string, PlayerGroupAgg>();
+  rows.forEach((r) => {
+    const attempts = (r.attempts as GroupAttempt[]) ?? [];
+    attempts.forEach((a) => {
+      if (!map.has(a.player_id)) {
+        map.set(a.player_id, { answered: 0, correct: 0, correctTimes: [], wrongTimes: [], allTimes: [] });
+      }
+      const s = map.get(a.player_id)!;
+      s.answered += 1;
+      s.allTimes.push(a.time_s);
+      if (a.result === 'correct') {
+        s.correct += 1;
+        s.correctTimes.push(a.time_s);
+      } else {
+        s.wrongTimes.push(a.time_s);
+      }
+    });
+  });
+  return map;
+}
+
+/** The whole leaderboard + per-member breakdown, ranked. Points from v_user_detail; group counts from group_progress. */
 export async function getLeaderboard(): Promise<UserDetailStats[]> {
-  const { data, error } = await supabase.from('v_user_detail').select('*').order('leaderboard_rank', { ascending: true });
+  const [{ data, error }, groupAgg] = await Promise.all([
+    supabase.from('v_user_detail').select('*').order('leaderboard_rank', { ascending: true }),
+    getGroupAttemptsAggByPlayer(),
+  ]);
   if (error) throw error;
   const rows = data ?? [];
 
@@ -33,6 +78,7 @@ export async function getLeaderboard(): Promise<UserDetailStats[]> {
 
   return rows.map((r) => {
     const user = userMap.get(r.user_id);
+    const g = groupAgg.get(r.user_id);
     return {
       userId: r.user_id,
       name: r.name,
@@ -46,8 +92,8 @@ export async function getLeaderboard(): Promise<UserDetailStats[]> {
       leaderboardRank: r.leaderboard_rank ?? 0,
       soloAnswered: r.solo_answered,
       soloCorrect: r.solo_correct,
-      groupAnswered: r.group_answered,
-      groupCorrect: r.group_correct,
+      groupAnswered: g?.answered ?? 0,
+      groupCorrect: g?.correct ?? 0,
       onevoneAnswered: r.onevone_answered,
       onevoneCorrect: r.onevone_correct,
       matchesPlayed: r.matches_played,
@@ -61,38 +107,42 @@ export interface GroupRadarResult {
   users: Array<{ userId: string; name: string; color: string }>;
 }
 
-/** Correct-answer counts per member per subject in group mode. Backed by v_group_radar. */
+/** Correct-answer counts per member per round in group mode (rounds replace subjects here). */
 export async function getGroupRadar(): Promise<GroupRadarResult> {
-  const { data, error } = await supabase.from('v_group_radar').select('*');
+  const { data, error } = await supabase.from('group_progress').select('round_no,attempts,final');
   if (error) throw error;
-  const rawRows = data ?? [];
+  const rows = data ?? [];
 
-  const subjectIds = Array.from(new Set(rawRows.map((r) => r.subject_id).filter((id: string | null): id is string => !!id))) as string[];
-  const userIds = Array.from(new Set(rawRows.map((r) => r.user_id).filter((id: string | null): id is string => !!id))) as string[];
+  const byRound = new Map<number, Record<string, number>>();
+  ROUND_NUMBERS.forEach((r) => byRound.set(r, {}));
+  const playerIds = new Set<string>();
 
-  const [subjects, userMap] = await Promise.all([
-    Promise.all(subjectIds.map((id) => getSubjectById(id))),
-    getUsersByIds(userIds),
-  ]);
-  const subjectNameMap = new Map<string, string>();
-  subjects.forEach((s) => {
-    if (s) subjectNameMap.set(s.id, s.name);
+  rows.forEach((r) => {
+    if (r.final !== 'correct') return;
+    const attempts = (r.attempts as GroupAttempt[]) ?? [];
+    const winner = attempts.find((a) => a.result === 'correct');
+    if (!winner) return;
+    playerIds.add(winner.player_id);
+    const bucket = byRound.get(r.round_no) ?? {};
+    bucket[winner.player_id] = (bucket[winner.player_id] ?? 0) + 1;
+    byRound.set(r.round_no, bucket);
   });
 
-  const bySubject = new Map<string, { subjectId: string; subject: string; [userId: string]: string | number }>();
-  rawRows.forEach((r) => {
-    if (!r.subject_id) return;
-    if (!bySubject.has(r.subject_id)) {
-      bySubject.set(r.subject_id, { subjectId: r.subject_id, subject: subjectNameMap.get(r.subject_id) ?? r.subject_id });
-    }
-    if (r.user_id) {
-      bySubject.get(r.subject_id)![r.user_id] = r.correct_count ?? 0;
-    }
+  const userMap = await getUsersByIds(Array.from(playerIds));
+
+  const radarRows = ROUND_NUMBERS.map((roundNo) => {
+    const row: { subjectId: string; subject: string; [userId: string]: string | number } = {
+      subjectId: `round-${roundNo}`,
+      subject: ROUND_LABELS[roundNo],
+    };
+    const bucket = byRound.get(roundNo) ?? {};
+    Object.entries(bucket).forEach(([uid, count]) => { row[uid] = count; });
+    return row;
   });
 
   return {
-    rows: Array.from(bySubject.values()),
-    users: userIds
+    rows: radarRows,
+    users: Array.from(playerIds)
       .filter((id) => userMap.has(id))
       .map((id) => ({ userId: id, name: userMap.get(id)!.name, color: userMap.get(id)!.color })),
   };
@@ -107,26 +157,24 @@ export interface GroupSpeedRow {
   avg: number;
 }
 
-/** Average answer speed per member in group mode (ms → seconds). Backed by v_group_speed. */
+/** Average answer speed per member in group mode, computed straight from group_progress attempts (already in seconds). */
 export async function getGroupSpeed(): Promise<GroupSpeedRow[]> {
-  const { data, error } = await supabase.from('v_group_speed').select('*');
-  if (error) throw error;
-  const rows = data ?? [];
-  const userMap = await getUsersByIds(rows.map((r) => r.user_id).filter((id: string | null): id is string => !!id));
+  const agg = await getGroupAttemptsAggByPlayer();
+  const userMap = await getUsersByIds(Array.from(agg.keys()));
 
-  const toSeconds = (ms: number | null) => (ms ? Math.round(ms / 100) / 10 : 0);
+  const avg = (arr: number[]) => (arr.length ? Math.round((arr.reduce((a, b) => a + b, 0) / arr.length) * 10) / 10 : 0);
 
-  return rows
-    .filter((r): r is typeof r & { user_id: string } => !!r.user_id && userMap.has(r.user_id))
-    .map((r) => {
-      const user = userMap.get(r.user_id)!;
+  return Array.from(agg.entries())
+    .filter(([id]) => userMap.has(id))
+    .map(([id, s]) => {
+      const u = userMap.get(id)!;
       return {
-        userId: r.user_id,
-        name: user.name,
-        color: user.color,
-        correct: toSeconds(r.avg_correct_ms),
-        wrong: toSeconds(r.avg_wrong_ms),
-        avg: toSeconds(r.avg_overall_ms),
+        userId: id,
+        name: u.name,
+        color: u.color,
+        correct: avg(s.correctTimes),
+        wrong: avg(s.wrongTimes),
+        avg: avg(s.allTimes),
       };
     });
 }
@@ -171,6 +219,17 @@ export function subscribeToPoints(onChange: () => void): () => void {
   const channel = supabase
     .channel('user-points-changes')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'user_points' }, onChange)
+    .subscribe();
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
+
+/** Live-updates group-mode stats (radar/speed/leaderboard counts) as rounds are played. */
+export function subscribeToGroupProgress(onChange: () => void): () => void {
+  const channel = supabase
+    .channel('group-progress-changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'group_progress' }, onChange)
     .subscribe();
   return () => {
     supabase.removeChannel(channel);
